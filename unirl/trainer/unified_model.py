@@ -427,7 +427,8 @@ class UnifiedModelTrainer(BaseTrainer):
             request_conditions={},
             sampling_params=req.sampling_params,
         )
-        ar_resp = ar_engine.generate(ar_req)
+        with self._step_timer.phase("ar_generate"):
+            ar_resp = ar_engine.generate(ar_req)
         ar_inner = ar_resp.tracks.get(AR_TRACK)
         recaptions = ar_inner.decoded if ar_inner is not None else None
         if not isinstance(recaptions, Texts):
@@ -470,7 +471,8 @@ class UnifiedModelTrainer(BaseTrainer):
             sampling_params={"diffusion": diff_params},
             init_noise_group_ids=dit_noise_gids,
         )
-        dit_resp = dit_engine.generate(dit_req)
+        with self._step_timer.phase("dit_generate"):
+            dit_resp = dit_engine.generate(dit_req)
         img_inner = dit_resp.tracks.get(IMAGE_TRACK)
         if img_inner is None:
             raise RuntimeError(
@@ -524,21 +526,25 @@ class UnifiedModelTrainer(BaseTrainer):
         if sync_weights and self.weight_sync is not None:
             if self._enable_fsdp_offload:
                 self.backend.onload()
-            self.weight_sync.extract()
+            with self._step_timer.phase("weight_sync"):
+                self.weight_sync.extract()
             if self._enable_fsdp_offload:
                 self.backend.offload()
         #   2. Wake both engines (base on CPU → room; AR 0-3, DiT 4-7 disjoint),
         #      then PUSH the cached adapter from rank 0 into each engine's
         #      set_lora_from_tensors_copy (cross-process; engines are not siblings).
-        for _eng in self.ar_rollouts + self.dit_rollouts:
-            _eng.wake_up()
+        with self._step_timer.phase("wake_up"):
+            for _eng in self.ar_rollouts + self.dit_rollouts:
+                _eng.wake_up()
         if sync_weights and self.weight_sync is not None:
-            self.weight_sync.push()
+            with self._step_timer.phase("weight_sync"):
+                self.weight_sync.push()
         #   3. Rollout (base offloaded), then sleep engines and onload the base
         #      for the train backward.
         resp = self.run_rollout(req)
-        for _eng in self.ar_rollouts + self.dit_rollouts:
-            _eng.sleep()
+        with self._step_timer.phase("sleep"):
+            for _eng in self.ar_rollouts + self.dit_rollouts:
+                _eng.sleep()
         if self._enable_fsdp_offload:
             self.backend.onload()
 
@@ -564,7 +570,8 @@ class UnifiedModelTrainer(BaseTrainer):
             sampling_params=req.sampling_params,
             metadata=[],
         )
-        scored = self.reward.score_and_attach(req=reward_req, track=img_track)
+        with self._step_timer.phase("reward"):
+            scored = self.reward.score_and_attach(req=reward_req, track=img_track)
         if scored.rewards is not None:
             scored.rewards = hydrate(scored.rewards)
         resp.tracks[IMAGE_TRACK] = scored
@@ -597,11 +604,12 @@ class UnifiedModelTrainer(BaseTrainer):
             media_prompts={IMAGE_TRACK: list(reward_texts.texts)},
         )
         # 5. Two backward (shared backbone) → one optimizer step.
-        results: Dict[str, TrainStepResult] = self.stack.train_track(
-            resp.tracks[AR_TRACK],
-            resp.tracks[IMAGE_TRACK],
-            training_progress=float(training_progress),
-        )
+        with self._step_timer.phase("train"):
+            results: Dict[str, TrainStepResult] = self.stack.train_track(
+                resp.tracks[AR_TRACK],
+                resp.tracks[IMAGE_TRACK],
+                training_progress=float(training_progress),
+            )
         self.wandb_logger.log_rollout_step(
             rollout_id,
             results,

@@ -271,11 +271,12 @@ class PETrainer(BaseTrainer):
         ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
-        self.rollout.wake_up()
+        self.rollout.wake_up()  # timed by install_phase_timing → "wake_up"
         if sync_weights and self.diffusion_sync is not None:
-            self.diffusion_sync.sync()
-            if self.ar_sync is not None:
-                self.ar_sync.sync()
+            with self._step_timer.phase("weight_sync"):
+                self.diffusion_sync.sync()
+                if self.ar_sync is not None:
+                    self.ar_sync.sync()
         # Free both tracks' train state during the separate-engine generate.
         # Sync above reads the FSDP weights, so offload only after it. A frozen
         # LLM has no AR backend, so only the diffusion train state is offloaded.
@@ -284,8 +285,8 @@ class PETrainer(BaseTrainer):
             self.diffusion.backend.offload()
             if self.ar.backend is not None:
                 self.ar.backend.offload()
-        resp = self.rollout.generate(req)
-        self.rollout.sleep()
+        resp = self.rollout.generate(req)  # timed by install_phase_timing → "generate"
+        self.rollout.sleep()  # timed by install_phase_timing → "sleep"
         if do_fsdp_offload:
             self.diffusion.backend.onload()
             if self.ar.backend is not None:
@@ -302,7 +303,8 @@ class PETrainer(BaseTrainer):
         diff_track = resp.tracks["diffusion"]
         n_track, p = len(diff_track.sample_ids), max(1, req.batch_size)
         reward_req = req.repeat_interleave(n_track // p) if n_track > p and n_track % p == 0 else req
-        scored = self.reward.score_and_attach(req=reward_req, track=diff_track)
+        with self._step_timer.phase("reward"):
+            scored = self.reward.score_and_attach(req=reward_req, track=diff_track)
         # propagate_rewards reshapes child.rewards directly (no hydration), so
         # turn the worker-returned TensorRef into a real tensor first.
         if scored.rewards is not None:
@@ -343,10 +345,12 @@ class PETrainer(BaseTrainer):
         )
         # 5. Route each TRAINED track to its own stack (each DP_SCATTER-sharded
         #    on dispatch). A frozen LLM trains the diffusion track only.
-        results: Dict[str, TrainStepResult] = {
-            name: getattr(self, name).stack.train_track(resp.tracks[name], training_progress=float(training_progress))
-            for name in self._train_tracks
-        }
+        results: Dict[str, TrainStepResult] = {}
+        for name in self._train_tracks:
+            with self._step_timer.phase(f"train_{name}"):
+                results[name] = getattr(self, name).stack.train_track(
+                    resp.tracks[name], training_progress=float(training_progress)
+                )
         self.wandb_logger.log_rollout_step(rollout_id, results, resp, step_time_s=time.perf_counter() - t0)
         return results, mean_reward
 

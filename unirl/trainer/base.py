@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
+from unirl.utils.latency_tracker import LatencyTracker
+
 from unirl.distributed.group.device_pool import DevicePool
 from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, total_samples_per_prompt
 
@@ -128,6 +130,12 @@ class BaseTrainer:
         from unirl.utils.wandb_logger import install_phase_timing
 
         install_phase_timing(self)
+
+        # Per-phase latency tracker for tail-latency (P50/P95/P99) analysis.
+        # Collection is driven by install_phase_timing's post-step hook;
+        # percentiles are logged at _latency_log_interval via the logger.
+        self._latency_tracker = LatencyTracker()
+        self._latency_log_interval = max(1, int(os.environ.get("UNIRL_LATENCY_LOG_INTERVAL", 10)))
 
     # ---- transport buffer reclaim (shared by all v2 trainers) --------------
 

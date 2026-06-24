@@ -126,7 +126,12 @@ def install_phase_timing(trainer: Any) -> None:
     @functools.wraps(inner)
     def _steady_step(*args, **kwargs):
         trainer._step_timer = PhaseTimer()  # re-arm: fresh phases for this step
-        return inner(*args, **kwargs)
+        result = inner(*args, **kwargs)
+
+        # ── Collect phase latency samples for tail-analysis ──
+        _collect_phase_latency(trainer)
+
+        return result
 
     @functools.wraps(inner)
     def _first_step(*args, **kwargs):
@@ -136,7 +141,12 @@ def install_phase_timing(trainer: Any) -> None:
         trainer._step_timer = PhaseTimer()
         _wrap_step_collaborators(trainer)
         trainer.train_step = _steady_step
-        return inner(*args, **kwargs)
+        result = inner(*args, **kwargs)
+
+        # ── Collect phase latency samples for tail-analysis ──
+        _collect_phase_latency(trainer)
+
+        return result
 
     trainer._step_timer = PhaseTimer()  # target for any pre-step evaluate()
     trainer.train_step = _first_step
@@ -173,6 +183,36 @@ def _wrap_step_collaborators(trainer: Any) -> None:
         return log_inner(*args, **kwargs)
 
     trainer.wandb_logger.log_rollout_step = _log_with_phases
+
+
+def _collect_phase_latency(trainer: Any) -> None:
+    """Collect per-step phase times into trainer's latency tracker.
+
+    Called after every ``train_step`` from the phase-timing wrappers
+    (``_steady_step`` / ``_first_step``).  Samples are consumed by
+    periodic percentile logging, so no duplicate collection logic lives
+    in the trainer or logger.
+
+    HI3's manual engine-phase timers (``ar_generate`` / ``dit_generate``
+    added in ``UnifiedModelTrainer.train_step``) also land here because
+    they accumulate into the same ``trainer._step_timer.phases`` dict.
+    """
+    tracker = getattr(trainer, "_latency_tracker", None)
+    if tracker is None:
+        return
+    for phase_name, elapsed in trainer._step_timer.phases.items():
+        tracker.add(phase_name, elapsed)
+
+    # Periodically flush percentile stats to wandb.
+    interval = getattr(trainer, "_latency_log_interval", 0)
+    if interval <= 0:
+        return
+    step_axis = getattr(trainer, "_step_count", 0)
+    trainer._step_count = step_axis + 1
+    if trainer._step_count % interval == 0:
+        stats = tracker.get_percentile_stats(clear=True)
+        if trainer.wandb_logger is not None:
+            trainer.wandb_logger.log_perf(trainer._step_count, stats)
 
 
 class UniRLWandBLogger:
